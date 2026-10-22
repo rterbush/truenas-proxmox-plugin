@@ -1,3 +1,44 @@
+truenas-proxmox-plugin (2.1.24~beta5) unstable; urgency=medium
+
+  * fix(nvme): close the i==25 reconnect blind spot in
+    _nvme_device_for_uuid and harden the fuser-based in-use probe
+    (GitHub #134). A VM being provisioned on an NVMe-oF subsystem
+    could tear down the shared controller mid-flight and knock out
+    every other running VM on the same subsystem. Two combined
+    defects produced this:
+
+      - The i==25 "stale connection" branch was the only mid-loop
+        reconnect site without an in-use guard. Its precondition
+        `!$ever_saw_devices` reads as "the subsystem is empty",
+        but `$ever_saw_devices` is set from the target UUID
+        lookup's linux_device_count, not the subsystem total; a
+        shared subsystem with 48 live namespaces could satisfy
+        this for the whole 15 s loop and still see the reconnect
+        fire. Apply the same in-use guard the i==10 / i==35 /
+        i==75 / i==150 branches use.
+
+      - `_nvme_check_devices_in_use` interpreted `run_command`'s
+        outcome as "$@ ? 0 : 1", collapsing every non-success
+        exit (spawn failures, timeouts, signal deaths) into
+        "not in use". Switch to `run_command(noerr => 1)` and
+        distinguish exit 0 (in use) from exit 1 (idle) from
+        anything else (unknown — fail-safe = assume in use).
+
+    Also uniform structured logging across every reconnect site in
+    `_nvme_device_for_uuid`: FIRING / SKIPPED lines now carry the
+    iteration label (i==10 / i==25 / i==35 / i==75 / i==125 /
+    i==150), the reason, dev_paths count, and in_use value. Future
+    field reports pin the responsible branch directly instead of
+    inferring from timing.
+
+    Validated with a mocked unit test (unpatched build fires the
+    reconnect; patched build logs the new SKIPPED line and does
+    not call _nvme_disconnect) and two iterations of
+    proxmox-test-runner storage-plugin-validation against
+    truenas-storage (0 failed per iteration).
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Wed, 22 Oct 2026 12:30:00 -0400
+
 truenas-proxmox-plugin (2.1.24~beta4) unstable; urgency=medium
 
   * fix(broker): correct systemd ordering so pvestatd/pvedaemon wait
