@@ -6291,26 +6291,53 @@ sub _nvme_get_subsystem_device_paths {
 }
 
 # Check if any of the given device paths are in use by a running process.
-# Returns: 1 if any device is in use (unsafe to disconnect), 0 if all clear.
+# Returns: 1 if any device is in use OR the probe outcome is uncertain
+# (unsafe to disconnect), 0 only when fuser conclusively reports no process
+# holds any of them.
+#
+# #134: the earlier version returned $@ ? 0 : 1, which collapsed every
+# non-zero exit — including spawn failures, timeouts, and signal deaths —
+# into "not in use". The real "not in use" signal from fuser -s is
+# specifically exit 1; anything else is "unknown, assume in use" so a
+# shared-subsystem reconnect can't silently blast through on a flaky probe.
 sub _nvme_check_devices_in_use {
     my ($scfg, @device_paths) = @_;
     return 0 unless @device_paths;
 
-    # Fail safe: if fuser not available, assume in use
     if (! -x '/usr/bin/fuser' && ! -x '/bin/fuser') {
-        _log($scfg, 1, 'warning', "[TrueNAS] fuser not found, cannot verify device safety");
+        _log($scfg, 1, 'warning', "[TrueNAS] fuser not found, cannot verify device safety — assuming in use");
         return 1;
     }
 
-    # fuser -s: exit 0 = at least one device has active process
-    #           exit 1 = none accessed (run_command dies on non-zero)
+    # fuser -s: exit 0 = at least one device has an active process
+    #           exit 1 = none accessed
+    #           other  = probe failed; cannot distinguish → treat as in use
+    # run_command(noerr => 1) returns the exit code instead of dying on
+    # non-zero, so we see exit 1 and any other failure separately.
+    my $exit;
     eval {
-        run_command(['fuser', '-s', @device_paths],
+        $exit = run_command(['fuser', '-s', @device_paths],
             outfunc => sub {},
             errfunc => sub {},
+            noerr   => 1,
         );
     };
-    return $@ ? 0 : 1;  # $@ set = no processes = not in use
+    if ($@ || !defined $exit) {
+        _log($scfg, 1, 'warning',
+            "[TrueNAS] fuser probe failed on " . scalar(@device_paths)
+            . " device(s): " . ($@ || 'no exit code') . " — assuming in use");
+        return 1;
+    }
+    if ($exit == 0) {
+        return 1;
+    } elsif ($exit == 1) {
+        return 0;
+    } else {
+        _log($scfg, 1, 'warning',
+            "[TrueNAS] fuser returned unexpected exit $exit on "
+            . scalar(@device_paths) . " device(s) — assuming in use");
+        return 1;
+    }
 }
 
 # Get device path for namespace by matching subsystem NQN and namespace properties
@@ -6377,22 +6404,24 @@ sub _nvme_device_for_uuid {
             my @dev_paths = _nvme_get_subsystem_device_paths($scfg);
             if (_nvme_check_devices_in_use($scfg, @dev_paths)) {
                 _log($scfg, 1, 'warning',
-                    "[TrueNAS] nvme_device_for_uuid: stale NGUIDs detected (early) but "
-                    . scalar(@dev_paths) . " device(s) are in use, skipping reconnect");
+                    "[TrueNAS] nvme_device_for_uuid: i==10 reconnect SKIPPED "
+                    . "(early-NGUID): dev_paths=" . scalar(@dev_paths)
+                    . ", in_use=1");
             } else {
                 $reconnect_attempted = 1;
                 _log($scfg, 1, 'warning',
-                    "[TrueNAS] nvme_device_for_uuid: stale NGUID contradiction detected (early) "
-                    . "- " . scalar(@dev_paths) . " devices, none in use, reconnecting");
+                    "[TrueNAS] nvme_device_for_uuid: i==10 reconnect FIRING "
+                    . "(early-NGUID contradiction): dev_paths="
+                    . scalar(@dev_paths) . ", in_use=0");
                 eval { _nvme_disconnect($scfg) };
                 usleep(500_000);
                 eval { _nvme_connect($scfg) };
                 if ($@) {
                     _log($scfg, 0, 'err',
-                        "[TrueNAS] nvme_device_for_uuid: reconnect failed: $@");
+                        "[TrueNAS] nvme_device_for_uuid: i==10 reconnect failed: $@");
                 } else {
                     _log($scfg, 1, 'info',
-                        "[TrueNAS] nvme_device_for_uuid: reconnect completed, "
+                        "[TrueNAS] nvme_device_for_uuid: i==10 reconnect completed, "
                         . "resuming device discovery");
                 }
             }
@@ -6401,20 +6430,47 @@ sub _nvme_device_for_uuid {
             eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
             eval { _nvme_rescan_subsystem_controllers($scfg) };
         } elsif ($i == 25 && !$reconnect_attempted && !$ever_saw_devices && _nvme_is_connected($scfg)) {
-            # No $allow_reconnect check needed: zero devices means no VMs are affected.
-            # Stale connection recovery: subsystem shows connected but zero block devices
-            # have appeared across all iterations. The TrueNAS target has likely stopped
-            # publishing namespaces over this connection. Reconnecting forces re-enumeration.
-            # Safe because zero devices means no VMs are using this subsystem.
-            $reconnect_attempted = 1;
-            _log($scfg, 1, 'warning', "[TrueNAS] nvme_device_for_uuid: stale NVMe connection detected - subsystem connected but 0 devices after 2.5s, reconnecting");
-            eval { _nvme_disconnect($scfg) };
-            usleep(500_000);  # 500ms for disconnect to settle
-            eval { _nvme_connect($scfg) };
-            if ($@) {
-                _log($scfg, 0, 'err', "[TrueNAS] nvme_device_for_uuid: reconnect failed: $@");
+            # Stale connection recovery: subsystem shows connected but a device
+            # for the TARGET UUID has not appeared after 2.5s. The TrueNAS
+            # target may have stopped publishing this namespace; a reconnect
+            # forces re-enumeration.
+            #
+            # #134: the earlier version of this branch fired unconditionally
+            # on the rationale "zero devices means no VMs are affected". That
+            # rationale was wrong: $ever_saw_devices tracks whether a device
+            # matching the TARGET UUID was seen, not whether the subsystem is
+            # otherwise empty. A shared subsystem can have 48 live namespaces
+            # serving running VMs while the specific UUID we're waiting on is
+            # held off the wire by a target-side issue; reconnecting in that
+            # state tears down the controller and causes I/O errors on every
+            # unrelated VM. Apply the same in-use guard used at i==10/35/75:
+            # if any device under this subsystem is held open by a running
+            # process, skip the reconnect and let the device-wait loop keep
+            # polling. The target UUID still won't appear, but the activate
+            # will fail cleanly instead of taking collateral VMs down with it.
+            my @dev_paths = _nvme_get_subsystem_device_paths($scfg);
+            if (@dev_paths && _nvme_check_devices_in_use($scfg, @dev_paths)) {
+                _log($scfg, 1, 'warning',
+                    "[TrueNAS] nvme_device_for_uuid: i==25 reconnect SKIPPED "
+                    . "(stale-connection, target UUID not visible but other "
+                    . "subsystem devices in use): dev_paths="
+                    . scalar(@dev_paths) . ", in_use=1 — refusing to disrupt "
+                    . "them (GitHub #134)");
             } else {
-                _log($scfg, 1, 'info', "[TrueNAS] nvme_device_for_uuid: reconnect completed, resuming device discovery");
+                $reconnect_attempted = 1;
+                _log($scfg, 1, 'warning',
+                    "[TrueNAS] nvme_device_for_uuid: i==25 reconnect FIRING "
+                    . "(stale-connection, subsystem connected but 0 devices "
+                    . "after 2.5s): dev_paths=" . scalar(@dev_paths)
+                    . ", in_use=0");
+                eval { _nvme_disconnect($scfg) };
+                usleep(500_000);  # 500ms for disconnect to settle
+                eval { _nvme_connect($scfg) };
+                if ($@) {
+                    _log($scfg, 0, 'err', "[TrueNAS] nvme_device_for_uuid: i==25 reconnect failed: $@");
+                } else {
+                    _log($scfg, 1, 'info', "[TrueNAS] nvme_device_for_uuid: i==25 reconnect completed, resuming device discovery");
+                }
             }
         } elsif ($i == 30) {
             # Another settle with trigger
@@ -6450,30 +6506,33 @@ sub _nvme_device_for_uuid {
             };
             if ($tn_has_uuid) {
                 my $is_last_resort = ($i == 125);
+                my $tag = $is_last_resort ? 'i==125' : 'i==75';
                 my @dev_paths = _nvme_get_subsystem_device_paths($scfg);
                 my $in_use = _nvme_check_devices_in_use($scfg, @dev_paths);
                 if ($in_use && !$is_last_resort) {
                     _log($scfg, 1, 'warning',
-                        "[TrueNAS] nvme_device_for_uuid: target $device_uuid confirmed on TN "
-                        . "but not visible after ~7.5s; "
-                        . scalar(@dev_paths) . " subsystem device(s) in use, "
-                        . "deferring reconnect to i==125 last-resort");
+                        "[TrueNAS] nvme_device_for_uuid: $tag reconnect SKIPPED "
+                        . "(target $device_uuid confirmed on TN but not visible): "
+                        . "dev_paths=" . scalar(@dev_paths)
+                        . ", in_use=1 — deferring to i==125 last-resort");
                 } else {
                     $reconnect_attempted = 1;
-                    my $when = $is_last_resort ? 'i==125 last-resort' : 'i==75 halfway';
-                    my $note = $in_use ? " (forcing despite $in_use device(s) in use)" : '';
+                    my $kind = $is_last_resort ? 'last-resort' : 'halfway';
                     _log($scfg, 1, 'warning',
-                        "[TrueNAS] nvme_device_for_uuid: $when reconnect for target $device_uuid"
-                        . $note);
+                        "[TrueNAS] nvme_device_for_uuid: $tag reconnect FIRING "
+                        . "($kind, target $device_uuid confirmed on TN): "
+                        . "dev_paths=" . scalar(@dev_paths)
+                        . ", in_use=$in_use"
+                        . ($in_use ? " (last-resort forces despite in-use)" : ""));
                     eval { _nvme_disconnect($scfg) };
                     usleep(500_000);
                     eval { _nvme_connect($scfg) };
                     if ($@) {
                         _log($scfg, 0, 'err',
-                            "[TrueNAS] nvme_device_for_uuid: $when reconnect failed: $@");
+                            "[TrueNAS] nvme_device_for_uuid: $tag reconnect failed: $@");
                     } else {
                         _log($scfg, 1, 'info',
-                            "[TrueNAS] nvme_device_for_uuid: $when reconnect completed");
+                            "[TrueNAS] nvme_device_for_uuid: $tag reconnect completed");
                     }
                 }
             }
@@ -6490,22 +6549,24 @@ sub _nvme_device_for_uuid {
             my @dev_paths = _nvme_get_subsystem_device_paths($scfg);
             if (_nvme_check_devices_in_use($scfg, @dev_paths)) {
                 _log($scfg, 1, 'warning',
-                    "[TrueNAS] nvme_device_for_uuid: stale NGUIDs detected but "
-                    . scalar(@dev_paths) . " device(s) are in use, skipping reconnect");
+                    "[TrueNAS] nvme_device_for_uuid: i==35 reconnect SKIPPED "
+                    . "(stale-NGUID): dev_paths=" . scalar(@dev_paths)
+                    . ", in_use=1");
             } else {
                 $reconnect_attempted = 1;
                 _log($scfg, 1, 'warning',
-                    "[TrueNAS] nvme_device_for_uuid: stale NGUID connection detected "
-                    . "- " . scalar(@dev_paths) . " devices, none in use, reconnecting");
+                    "[TrueNAS] nvme_device_for_uuid: i==35 reconnect FIRING "
+                    . "(stale-NGUID): dev_paths=" . scalar(@dev_paths)
+                    . ", in_use=0");
                 eval { _nvme_disconnect($scfg) };
                 usleep(500_000);
                 eval { _nvme_connect($scfg) };
                 if ($@) {
                     _log($scfg, 0, 'err',
-                        "[TrueNAS] nvme_device_for_uuid: reconnect failed: $@");
+                        "[TrueNAS] nvme_device_for_uuid: i==35 reconnect failed: $@");
                 } else {
                     _log($scfg, 1, 'info',
-                        "[TrueNAS] nvme_device_for_uuid: reconnect completed, "
+                        "[TrueNAS] nvme_device_for_uuid: i==35 reconnect completed, "
                         . "resuming device discovery");
                 }
             }
@@ -6584,22 +6645,24 @@ sub _nvme_device_for_uuid {
         : 0;
     if (!$allow_reconnect) {
         _log($scfg, 0, 'warning',
-            "[TrueNAS] nvme_device_for_uuid: emergency reconnect SKIPPED "
-            . "(allow_reconnect=0) — caller did not opt in");
+            "[TrueNAS] nvme_device_for_uuid: i==150 emergency reconnect SKIPPED "
+            . "(allow_reconnect=0): dev_paths=" . scalar(@_emg_dev_paths)
+            . ", in_use=$_emg_in_use — caller did not opt in");
     } elsif (!_nvme_is_connected($scfg)) {
         _log($scfg, 0, 'warning',
-            "[TrueNAS] nvme_device_for_uuid: emergency reconnect SKIPPED "
-            . "(_nvme_is_connected=0) — subsystem not currently connected");
+            "[TrueNAS] nvme_device_for_uuid: i==150 emergency reconnect SKIPPED "
+            . "(_nvme_is_connected=0): dev_paths=" . scalar(@_emg_dev_paths)
+            . ", in_use=$_emg_in_use — subsystem not currently connected");
     } elsif ($_emg_in_use) {
         _log($scfg, 0, 'warning',
-            "[TrueNAS] nvme_device_for_uuid: emergency reconnect SKIPPED "
-            . "for UUID $device_uuid — shared subsystem is in use by "
-            . "other process(es); refusing to disrupt the consumers of "
-            . "the shared controller (GitHub #131). Admin: verify the "
-            . "namespace is published on TrueNAS, then — only when no "
-            . "consumers are using this subsystem — manually "
-            . "`nvme disconnect` + `nvme connect` to flush the "
-            . "controller's stale namespace cache.");
+            "[TrueNAS] nvme_device_for_uuid: i==150 emergency reconnect SKIPPED "
+            . "for UUID $device_uuid: dev_paths=" . scalar(@_emg_dev_paths)
+            . ", in_use=1 — shared subsystem is in use by other process(es); "
+            . "refusing to disrupt the consumers of the shared controller "
+            . "(GitHub #131). Admin: verify the namespace is published on "
+            . "TrueNAS, then — only when no consumers are using this "
+            . "subsystem — manually `nvme disconnect` + `nvme connect` to "
+            . "flush the controller's stale namespace cache.");
     } else {
         # Before the emergency reconnect, sweep orphan namespaces off our
         # subsystem. Under multi-node load the publication-mismatch that
@@ -6620,17 +6683,18 @@ sub _nvme_device_for_uuid {
             ? " (SECOND reconnect — prior mid-loop reconnect fired too early)"
             : "";
         _log($scfg, 0, 'warning',
-            "[TrueNAS] nvme_device_for_uuid: EMERGENCY RECONNECT after 150-iteration budget "
-            . "exhausted for UUID $device_uuid$note — flushing stale kernel namespace cache");
+            "[TrueNAS] nvme_device_for_uuid: i==150 emergency reconnect FIRING "
+            . "for UUID $device_uuid: dev_paths=" . scalar(@_emg_dev_paths)
+            . ", in_use=0$note — flushing stale kernel namespace cache");
         eval { _nvme_disconnect($scfg) };
         usleep(500_000);
         eval { _nvme_connect($scfg) };
         if ($@) {
             _log($scfg, 0, 'err',
-                "[TrueNAS] nvme_device_for_uuid: emergency reconnect failed: $@");
+                "[TrueNAS] nvme_device_for_uuid: i==150 emergency reconnect failed: $@");
         } else {
             _log($scfg, 0, 'warning',
-                "[TrueNAS] nvme_device_for_uuid: emergency reconnect completed, "
+                "[TrueNAS] nvme_device_for_uuid: i==150 emergency reconnect completed, "
                 . "re-scanning for target UUID");
             eval { _nvme_rescan_subsystem_controllers($scfg) };
             eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
@@ -6640,14 +6704,14 @@ sub _nvme_device_for_uuid {
                 my $device = _nvme_selector_selected_device_path($result);
                 if ($device && -b $device) {
                     _log($scfg, 0, 'warning',
-                        "[TrueNAS] nvme_device_for_uuid: RECOVERED via emergency reconnect at j=$j, "
+                        "[TrueNAS] nvme_device_for_uuid: RECOVERED via i==150 emergency reconnect at j=$j, "
                         . "device ready at $device");
                     return $device;
                 }
                 usleep(DEVICE_READY_TIMEOUT_US);
             }
             _log($scfg, 0, 'warning',
-                "[TrueNAS] nvme_device_for_uuid: emergency reconnect completed but target "
+                "[TrueNAS] nvme_device_for_uuid: i==150 emergency reconnect completed but target "
                 . "UUID still not visible after 2s — falling through to error");
         }
     }
