@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.24~beta5';
+our $VERSION = '2.1.24~beta6';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 16;
 use JSON::PP qw(encode_json decode_json);
@@ -2187,10 +2187,6 @@ sub _tn_extents($scfg) {
     return _set_cache($storage_id, 'extents', $res);
 }
 
-sub _tn_snapshots($scfg) {
-    return _api_call($scfg, 'pool.snapshot.query', []);
-}
-
 # ---------- Narrow-query helpers ----------
 # The full-list _tn_extents / _tn_targetextents scans above serialize every
 # extent / mapping on the TN side and pull them back over the wire, which
@@ -2810,6 +2806,16 @@ sub volume_snapshot_rollback {
 
 # Return a hash describing available snapshots for this volume.
 # Shape: { <snapname> => { id => <snapname>, timestamp => <epoch> }, ... }
+#
+# GitHub #135: the earlier implementation called `pool.snapshot.query` with
+# no filter and no `extra.properties`, so on a NAS with several thousand
+# snapshots it pulled every one down (~20 MB JSON, ~33 s) and then
+# client-side filtered by dataset. `qm rollback` makes three of these
+# calls per invocation (volume_rollback_is_possible plus the pair in
+# volume_snapshot_rollback), so a rollback took minutes. Delegate to
+# _tn_snapshot_query_datasets, which asks the middleware to filter by
+# dataset and return only the `creation` property — the same NAS answers
+# the one-dataset query in ~1-2 s.
 sub volume_snapshot_info {
     my ($class, $scfg, $storeid, $volname) = @_;
     my (undef, $zname) = $class->parse_volname($volname);
@@ -2817,22 +2823,13 @@ sub volume_snapshot_info {
 
     _log($scfg, 2, 'debug', "[TrueNAS] volume_snapshot_info: querying snapshots for $full");
 
-    my $list = _api_call($scfg, 'pool.snapshot.query', []) // [];
+    my $by_ds = _tn_snapshot_query_datasets($scfg, [$full]);
+    my $raw   = $by_ds->{$full} // {};
 
     my $snaps = {};
-    for my $s (@$list) {
-        my $name = $s->{name} // next; # "pool/ds@sn"
-        next unless $name =~ /^\Q$full\E\@(.+)$/;
-        my $snapname = $1;
-        my $ts = 0;
-        if (my $props = $s->{properties}) {
-            if (ref($props->{creation}) eq 'HASH') {
-                $ts = int($props->{creation}{rawvalue} // 0);
-            } elsif (defined $props->{creation} && !ref($props->{creation}) && $props->{creation} =~ /(\d{10})/) {
-                $ts = int($1);
-            }
-        }
-        $snaps->{$snapname} = { id => $snapname, timestamp => $ts };
+    for my $name (keys %$raw) {
+        my $ts = $raw->{$name}{ts} // 0;
+        $snaps->{$name} = { id => $name, timestamp => $ts };
     }
 
     return $snaps;

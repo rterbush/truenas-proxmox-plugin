@@ -1,3 +1,21 @@
+truenas-proxmox-plugin (2.1.24~beta6) unstable; urgency=medium
+
+  * fix(#135): drop the full-NAS snapshot scan from
+    `volume_snapshot_info`. The earlier implementation called
+    `pool.snapshot.query` with no filter and no `extra.properties`,
+    so on a NAS with several thousand snapshots it fetched every
+    snapshot on the array (~20 MB JSON, ~33 s per call) and then
+    filtered client-side. `qm rollback` makes three of these calls
+    per invocation, which put rollbacks in the multi-minute range
+    for anyone with a busy TrueNAS. Delegate to the existing
+    `_tn_snapshot_query_datasets` helper, which asks the middleware
+    to filter by dataset and return only the `creation` property --
+    the same NAS answers the one-dataset query in ~1.7 s on the
+    reporter's measurements. Also drop the unused `_tn_snapshots`
+    helper (dead code, zero callers).
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Thu, 23 Oct 2026 09:00:00 -0400
+
 truenas-proxmox-plugin (2.1.24~beta5) unstable; urgency=medium
 
   * fix(nvme): close the i==25 reconnect blind spot in
