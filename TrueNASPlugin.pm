@@ -6534,7 +6534,7 @@ sub _nvme_device_for_uuid {
                 my $tag = $is_last_resort ? 'i==125' : 'i==75';
                 my @dev_paths = _nvme_get_subsystem_device_paths($scfg);
                 my $in_use = _nvme_check_devices_in_use($scfg, @dev_paths);
-                if ($in_use && !$is_last_resort) {
+                if ($in_use) {
                     _log($scfg, 1, 'warning',
                         "[TrueNAS] nvme_device_for_uuid: $tag reconnect SKIPPED "
                         . "(target $device_uuid confirmed on TN but not visible): "
