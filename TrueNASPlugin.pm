@@ -6300,6 +6300,34 @@ sub _nvme_get_subsystem_device_paths {
 sub _nvme_check_devices_in_use {
     my ($scfg, @device_paths) = @_;
     return 0 unless @device_paths;
+    # argo-local-mountguard: a device mounted in ANY mount namespace (an LXC rootfs) is in use; fuser cannot see it.
+    {
+        my %want;
+        for my $p (@device_paths) {
+            my $n = $p; $n =~ s{.*/}{};
+            if (open(my $fh, "<", "/sys/class/block/$n/dev")) {
+                my $d = <$fh>; close $fh;
+                if (defined $d) { chomp $d; $want{$d} = 1 if $d ne ""; }
+            }
+        }
+        if (%want) {
+            for my $mi (glob("/proc/[0-9]*/mountinfo")) {
+                open(my $fh, "<", $mi) or next;
+                while (my $l = <$fh>) {
+                    my @f = split(/ /, $l);
+                    if (defined $f[2] && $want{$f[2]}) {
+                        close $fh;
+                        _log($scfg, 1, "warning", "[TrueNAS] argo-local mountguard: a device of the subsystem is mounted ($mi) — in use");
+                        return 1;
+                    }
+                }
+                close $fh;
+            }
+        } else {
+            _log($scfg, 1, "warning", "[TrueNAS] argo-local mountguard: no major:minor for the device(s) — assuming in use");
+            return 1;
+        }
+    }
 
     if (! -x '/usr/bin/fuser' && ! -x '/bin/fuser') {
         _log($scfg, 1, 'warning', "[TrueNAS] fuser not found, cannot verify device safety — assuming in use");
